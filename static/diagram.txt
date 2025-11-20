@@ -1,0 +1,48 @@
+@startuml
+!theme vibrant
+
+package "Text-to-Sign Pipeline" {
+    actor User
+    rectangle "Text Input" as Text
+
+    node "Transformer" {
+        rectangle "Transformer Model" as TFM
+    }
+
+    database "VQ-VAE Codebook" as VQ_Book
+
+    node "Baseline Generation" {
+        rectangle "Pose Segments" as Segments
+        rectangle "Stitch Poses" as Stitch
+        rectangle "Baseline Video (Robotic)" as Vid_Base
+    }
+
+    node "Refinement Stage" {
+        rectangle "GAN Refiner" as GAN
+        rectangle "DAE Refiner" as DAE
+        rectangle "Refined Pose" as Pose_Refined
+    }
+
+    node "Final Output" {
+        rectangle "Final Video (Smooth)" as Vid_Final
+    }
+}
+
+User --> Text
+Text --> TFM
+TFM ..> VQ_Book : "Uses (read-only)"
+TFM --> Segments : "Predicts sequence of..."
+
+Segments --> Stitch
+Stitch --> Vid_Base : "1. Baseline Output"
+
+' Refiner Paths
+Stitch --> GAN : "Path A (Stitched)"
+Segments --> DAE : "Path B (Un-stitched)"
+
+GAN --> Pose_Refined
+DAE --> Pose_Refined
+
+Pose_Refined --> Vid_Final : "2. Refined Output"
+
+@enduml
