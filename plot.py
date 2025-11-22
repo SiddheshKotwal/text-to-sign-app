@@ -9,6 +9,8 @@ from mpl_toolkits.mplot3d import Axes3D
 from tqdm import tqdm
 from pathlib import Path
 from typing import Union, List, Tuple
+import subprocess
+import shutil
 
 from skeleton_def import EDGES, JOINTS
 
@@ -33,7 +35,7 @@ def get_palette(
 def getDimBox(points):
     """
     points: ... N x DIM
-    output:	[[min_d1, max_d1], ..., [min_dN, max_dN]]
+    output: [[min_d1, max_d1], ..., [min_dN, max_dN]]
     """
     if points.dtype == torch.float16:
         points = points.to(torch.float32)
@@ -263,16 +265,24 @@ def make_pose_video(
     :return: None
     """
     save_dir = Path(save_dir)
-    if (save_dir / f"{video_name}.avi").exists() and not overwrite:
-        print(f"Video already exists: {save_dir}")
+    # Ensure proper extension
+    if not video_name.endswith(".mp4") and not video_name.endswith(".avi"):
+        video_name += ".mp4"
+        
+    if (save_dir / video_name).exists() and not overwrite:
+        print(f"Video already exists: {save_dir / video_name}")
         return
 
     poses, names = formate_poses(poses, names)
 
     # Create output video writer
-    # --- FIX: Create a unique temp directory for frames ---
-    video_name_stem = Path(video_name).stem
-    image_path = save_dir / f"{video_name_stem}_frames"
+    # Use a separate suffix for frames to avoid file/dir conflicts on Linux
+    video_stem = Path(video_name).stem
+    image_path = save_dir / f"{video_stem}_frames"
+    
+    # Cleanup previous frames if they exist to prevent mix-up
+    if image_path.exists():
+        shutil.rmtree(image_path)
     image_path.mkdir(parents=True, exist_ok=True)
 
     # print(f"Writing images to: {image_path}")
@@ -285,12 +295,15 @@ def make_pose_video(
         tqdm(zip(*poses), desc="Plotting poses", total=len(poses[0]))
     ):
         # for frame_num, p in enumerate(zip(*poses)):
-        if (image_path.absolute() / f"{frame_num}.jpeg").exists():
-            continue
+        # No need to check exists inside loop if we cleaned up start
+        
         fig, axs = plt.subplots(
             1, n_plots, figsize=(8 * n_plots, 8), subplot_kw=dict(projection="3d")
         )
         # plt.tight_layout()
+        if n_plots == 1:
+            axs = [axs]
+            
         for i in range(n_plots):
             if isinstance(names[i], list):
                 n = names[i][frame_num]
@@ -302,7 +315,7 @@ def make_pose_video(
                 p[i].unsqueeze(0),
                 connections=EDGES,
                 title=n,
-                ax=axs[i] if n_plots > 1 else axs,
+                ax=axs[i] if n_plots > 1 else axs[i],
                 azim=-80,
                 elev=-100,
                 show_axes=False,
@@ -313,7 +326,9 @@ def make_pose_video(
         fig.suptitle(main_title.replace(".", "").replace("$", ""), fontsize=20)
         # reduce fig size
         # fig.set_size_inches(6.5, 3)
-        fig.savefig(image_path.absolute() / f"{frame_num}.jpeg")
+        
+        # Save with Zero Padding for FFmpeg (0000.jpeg, 0001.jpeg)
+        fig.savefig(image_path.absolute() / f"{frame_num:04d}.jpeg")
         plt.close(fig)
 
     imagedir2video(image_path, save_dir, slow=slow, name=video_name, fps=fps)
@@ -349,14 +364,21 @@ def make_square_pose_video(
     :return: None
     """
     save_dir = Path(save_dir)
-    if (save_dir / f"{video_name}.avi").exists() and not overwrite:
+    if not video_name.endswith(".mp4") and not video_name.endswith(".avi"):
+        video_name += ".mp4"
+
+    if (save_dir / video_name).exists() and not overwrite:
         print(f"Video already exists: {save_dir}")
         return
 
     poses, names = formate_poses(poses, names)
 
     # Create output video writer
-    image_path = save_dir / video_name
+    video_stem = Path(video_name).stem
+    image_path = save_dir / f"{video_stem}_frames"
+    
+    if image_path.exists():
+        shutil.rmtree(image_path)
     image_path.mkdir(parents=True, exist_ok=True)
 
     # print(f"Writing images to: {image_path}")
@@ -368,9 +390,6 @@ def make_square_pose_video(
     for frame_num, p in enumerate(
         tqdm(zip(*poses), desc="Plotting poses", total=len(poses[0]))
     ):
-        # for frame_num, p in enumerate(zip(*poses)):
-        if (image_path.absolute() / f"{frame_num}.jpeg").exists():
-            continue
         fig, axs = plt.subplots(
             width,
             height,
@@ -402,7 +421,8 @@ def make_square_pose_video(
         fig.suptitle(main_title.replace(".", "").replace("$", ""), fontsize=20)
         # change fig resolution in pixels
         fig.set_size_inches(30, 30)
-        fig.savefig(image_path.absolute() / f"{frame_num}.jpeg")
+        # Save with padding
+        fig.savefig(image_path.absolute() / f"{frame_num:04d}.jpeg")
         plt.close(fig)
 
     imagedir2video(image_path, save_dir, slow=slow, name=video_name, fps=fps)
@@ -445,15 +465,51 @@ def imagedir2video(
 
     """Takes a directory of images and creates a video from them."""
     pose_plot_path = Path(pose_plot_path)
+    
+    # Try using FFmpeg first (Best for Browser Compatibility)
+    if shutil.which("ffmpeg"):
+        try:
+            # Determine output file
+            video_path = Path(save_dir) / name
+            if not video_path.suffix:
+                video_path = video_path.with_suffix(".mp4")
+                
+            print(f"Attempting FFmpeg encoding to {video_path}...")
+            
+            # Construct input pattern (e.g., path/%04d.jpeg)
+            input_pattern = str(pose_plot_path / "%04d.jpeg")
+            
+            cmd = [
+                "ffmpeg",
+                "-y",                   # Overwrite
+                "-framerate", str(fps), # Input FPS
+                "-i", input_pattern,
+                "-c:v", "libx264",      # H.264 Codec (Browser Safe)
+                "-pix_fmt", "yuv420p",  # Pixel format for compatibility
+                "-vf", f"setpts={slow}*PTS", # Slow down if needed
+                str(video_path)
+            ]
+            
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            print(f"Video saved successfully (FFmpeg): {video_path}")
+            return
+            
+        except subprocess.CalledProcessError as e:
+            print(f"FFmpeg failed: {e}. Falling back to OpenCV.")
+        except Exception as e:
+            print(f"FFmpeg error: {e}. Falling back to OpenCV.")
+
+    # --- Fallback to OpenCV ---
+    print("Using OpenCV fallback...")
+    
     # read all images in the folder
     sort_key = lambda x: int(x.stem.split(".")[0])
     pose_images = [img for img in pose_plot_path.glob("*.jpeg") if img.is_file()]
     pose_images.sort(key=sort_key)
 
-    # --- FIX 1: Check if any frames were actually generated ---
     if not pose_images:
-        print(f"Error: No .jpeg images found in {pose_plot_path}. Video not created.")
-        return  # Exit function to prevent creating an empty file
+        print("No images found to encode.")
+        return
 
     # create video writer
     video_path = Path(save_dir) / name
@@ -465,52 +521,40 @@ def imagedir2video(
     img = np.array(img)
     height, width, _ = img.shape
 
-    # Use a widely compatible codec
-    fourcc = cv2.VideoWriter_fourcc(*"avc1")  # H.264 codec
+    # Try different codecs for OpenCV
+    fourcc = cv2.VideoWriter_fourcc(*"avc1") # H.264
     videoOut = cv2.VideoWriter(str(video_path), fourcc, fps, (width, height))
-
-    # --- FIX 2: Check if VideoWriter opened successfully ---
+    
     if not videoOut.isOpened():
-        print("Warning: 'avc1' (H.264) codec failed. Falling back to 'mp4v'.")
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v") # Fallback
+        print("Warning: 'avc1' codec failed in OpenCV. Falling back to 'mp4v'.")
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         videoOut = cv2.VideoWriter(str(video_path), fourcc, fps, (width, height))
-        
-        if not videoOut.isOpened():
-            print(f"Error: Could not open video writer for {video_path}")
-            return # Exit if it still fails
 
-    print(f"Writing {len(pose_images)} frames to {video_path}...")
-    for i, pose_img_path in enumerate(pose_images):
+    for i, pose in enumerate(pose_images):
         try:
-            pose = Image.open(pose_img_path)
+            pose = Image.open(pose)
             pose = pose.convert("RGB")
             pose = np.array(pose)
             frame = pose.astype(np.uint8)
-            # convert to BGR for OpenCV
+            # convert to BGR
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             for _ in range(slow):
                 videoOut.write(frame)
         except Exception as e:
-            # --- FIX 3: Don't release video on a single bad frame ---
-            # The old code had a try/except that would call videoOut.release()
-            # This would corrupt the video. Now we just log the error.
-            print(f"Error processing frame {pose_img_path}: {e}")
-
+            print(f"Error writing frame {i}: {e}")
+            # videoOut.release() # Don't release early on single error
+        
         if i > 425:
-            print("Warning: Frame limit (425) reached.")
             break
 
     videoOut.release()
-    print(f"Video saved successfully: {video_path}")
+    print(f"Video saved successfully (OpenCV): {video_path}")
+
 
 def remove_files(image_path: Union[str, Path]) -> None:
     # remove image and folder
-    [
-        os.remove((image_path / file))
-        for file in os.listdir(str(image_path))
-        if file.endswith(".jpeg")
-    ]
-    os.rmdir(image_path)
+    if image_path.exists():
+        shutil.rmtree(image_path)
 
 
 def plot_codebook_pca(
