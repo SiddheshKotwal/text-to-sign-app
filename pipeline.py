@@ -72,12 +72,14 @@ def run_text_to_baseline(src, src_length, src_mask, trans_model, vq_config):
     Returns:
         - pose_segments (torch.Tensor): The *un-stitched* segments (for DAE).
         - stitched_baseline_pose (torch.Tensor): The *stitched* pose (for GAN/video).
+        - confidence (float): The average probability score of the prediction.
     """
     device = torch.device("cpu")
     model_settings = trans_model.hparams.config["model"]["beam_setting"]
 
     # 1. Run Transformer (Text -> VQ Tokens)
-    vq_tokens = trans_model.greedy_decode(
+    # --- ETHICAL UPDATE: Unpack confidence score ---
+    vq_tokens, confidence = trans_model.greedy_decode(
         src=src,
         src_length=src_length,
         src_mask=src_mask,
@@ -95,7 +97,7 @@ def run_text_to_baseline(src, src_length, src_mask, trans_model, vq_config):
     vq_tokens = vq_tokens[vq_tokens >= 4] - 4
 
     if len(vq_tokens) == 0:
-        return None, None  # Failed to generate
+        return None, None, 0.0  # Failed to generate
 
     # 3. Convert VQ Tokens to Poses (Baseline)
     # pose_segments shape: (N_tokens, window_size, pose_dim)
@@ -120,7 +122,7 @@ def run_text_to_baseline(src, src_length, src_mask, trans_model, vq_config):
     if not isinstance(stitched_baseline_pose, torch.Tensor):
         stitched_baseline_pose = torch.from_numpy(stitched_baseline_pose)
 
-    return pose_segments, stitched_baseline_pose
+    return pose_segments, stitched_baseline_pose, confidence
 
 
 # --- Pipeline Function 3: GAN Refinement ---

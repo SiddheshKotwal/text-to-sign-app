@@ -279,6 +279,9 @@ class Transformer(L.LightningModule):
         trg_mask = src_mask.new_ones([1, 1, 1])
 
         finished = src_mask.new_zeros(batch_size).byte()
+        
+        # --- ETHICAL UPDATE: Track confidence scores ---
+        confidence_scores = []
 
         for _ in range(max_output_length):
             # pylint: disable=unused-variable
@@ -294,7 +297,15 @@ class Transformer(L.LightningModule):
 
                 logits = self.vocab_layer(x)
                 logits = logits[:, -1]
-                _, next_word = torch.max(logits, dim=1)
+                
+                # --- ETHICAL UPDATE: Calculate probabilities ---
+                probs = F.softmax(logits, dim=-1)
+                max_prob, next_word = torch.max(probs, dim=1)
+                
+                # Store confidence for this token
+                confidence_scores.append(max_prob.item())
+                # -----------------------------------------------
+                
                 next_word = next_word.data
                 ys = torch.cat([ys, next_word.unsqueeze(-1)], dim=1)
 
@@ -306,7 +317,10 @@ class Transformer(L.LightningModule):
                 break
 
         ys = ys[:, 1:]  # remove BOS-symbol
-        return ys
+        
+        # --- ETHICAL UPDATE: Return average confidence ---
+        avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.0
+        return ys, avg_confidence
 
     def validation_step(self, batch, batch_idx):
         # called during training
@@ -319,7 +333,9 @@ class Transformer(L.LightningModule):
             max_len = self.beam_settings["max_output_length"]
             if max_len > code_prediction.shape[1]:
                 max_len = code_prediction.shape[1]
-            code_prediction = self.greedy_decode(**batch, max_output_length=max_len)
+            # Note: validation step doesn't use confidence, so we unpack and ignore it if returned
+            out = self.greedy_decode(**batch, max_output_length=max_len)
+            code_prediction = out[0] if isinstance(out, tuple) else out
         else:
             # not used so far
             code_prediction = self.beam_decode(**batch)
@@ -350,7 +366,8 @@ class Transformer(L.LightningModule):
             max_len = self.beam_settings["max_output_length"]
             if max_len > code_prediction.shape[1]:
                 max_len = code_prediction.shape[1]
-            code_prediction = self.greedy_decode(**batch, max_output_length=max_len)
+            out = self.greedy_decode(**batch, max_output_length=max_len)
+            code_prediction = out[0] if isinstance(out, tuple) else out
         else:
             code_prediction = self.beam_decode(**batch)
             self.log(

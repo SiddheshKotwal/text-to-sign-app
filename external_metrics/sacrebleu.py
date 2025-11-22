@@ -43,18 +43,13 @@ from typing import List, Iterable, Tuple, Union
 VERSION = "1.4.2"
 
 try:
-    # SIGPIPE is not available on Windows machines, throwing an exception.
-    from signal import SIGPIPE
-
-    # If SIGPIPE is available, change behaviour to default instead of ignore.
-    from signal import signal, SIG_DFL
-
+    # If SIGPIPE is available, change behaviour to default instead of
+    from signal import signal, SIG_DFL, SIGPIPE
     signal(SIGPIPE, SIG_DFL)
-
-except ImportError:
-    logging.warning(
-        "Could not import signal.SIGPIPE (this is expected on Windows machines)"
-    )
+except (ImportError, ValueError, AttributeError):
+    # ValueError catches the "main thread" error on Streamlit
+    # AttributeError/ImportError handles Windows compatibility
+    pass
 
 # Where to store downloaded test sets.
 # Define the environment variable $SACREBLEU, or use the default of ~/.sacrebleu.

@@ -1,37 +1,60 @@
-# --- AGGRESSIVE PosixPath FIX ---
-# This MUST be the very first block of code in app.py
 import sys
-import pathlib
 import os
+import pathlib
 
-if os.name == 'nt':  # Check if running on Windows
-    # This is a monkey-patch.
-    # It tells Python's unpickler that whenever it sees a
-    # 'pathlib.PosixPath' object in the file, it should
-    # actually create a 'pathlib.WindowsPath' object instead.
+# --- 1. FIX POSIX PATH (For Windows/Linux compatibility) ---
+if os.name == 'nt':
     pathlib.PosixPath = pathlib.WindowsPath
-# --- END FIX ---
 
-import torch  # <-- This torch import is now safe
+# --- 2. FIX SIGNAL ERROR (The "Main Thread" Crash) ---
+# Streamlit runs in a sub-thread, but sacrebleu tries to touch signals.
+# We must disable signal usage for sacrebleu before importing it.
+os.environ["SACREBLEU_NO_rod"] = "true"  # Sometimes helps specific versions
+
+# We monkey-patch the signal module to catch the specific error
+import signal
+original_signal = signal.signal
+
+def patched_signal(signalnum, handler):
+    try:
+        return original_signal(signalnum, handler)
+    except ValueError:
+        # This swallows the "signal only works in main thread" error
+        pass 
+
+signal.signal = patched_signal
+# ---------------------------------------------------------
+
+# --- 3. FIX IMPORT PATHS ---
+# Ensure the current directory is in the python path so 'constants', 'helpers', etc. are found
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# --- NOW IMPORT THE REST ---
+import torch
 import streamlit as st
 import pandas as pd
 import streamlit.components.v1 as components
 from pathlib import Path
 import numpy as np
-import base64  # <-- 1. IMPORTED BASE64
+import base64
+import sqlite3
 
 # --- Core App Imports ---
 import load_models
 import pipeline
+import db_utils
 
 # ---
-# 1. APPLICATION SETUP & MODEL LOADING
+# 1. APPLICATION SETUP & INITIALIZATION
 # ---
 st.set_page_config(
     layout="wide",
     page_title="Text-to-Sign Generation",
     page_icon="🤖"
 )
+
+# Initialize Database on startup
+db_utils.init_db()
 
 # Create a directory for temporary videos
 TEMP_VIDEO_DIR = Path("./temp_videos")
@@ -42,8 +65,12 @@ LIVE_BASELINE_VIDEO = TEMP_VIDEO_DIR / "live_baseline.mp4"
 LIVE_GAN_VIDEO = TEMP_VIDEO_DIR / "live_gan.mp4"
 LIVE_DAE_VIDEO = TEMP_VIDEO_DIR / "live_dae.mp4"
 
-# Load all models, configs, vocabs, and stats.
-assets = load_models.load_all_assets()
+# Load all models (cached)
+if 'assets' not in st.session_state:
+    with st.spinner("Loading Models..."):
+        st.session_state.assets = load_models.load_all_assets()
+
+assets = st.session_state.assets
 
 # Store W&B plot links
 wandb_plots = {
@@ -53,24 +80,116 @@ wandb_plots = {
     "diffusion": '<iframe src="https://wandb.ai/siddheshkotwal379-na/sign-pose-refinement/reports/Diffusion-Pose-Refinement--VmlldzoxNDk0ODY3NQ" style="border:none;height:1024px;width:100%"></iframe>',
 }
 
+# --- HELPER: CLEAR SESSION STATE ---
+def clear_generation_state():
+    """Clears all data related to video generation to ensure privacy between sessions."""
+    keys_to_clear = [
+        'baseline_video_bytes', 
+        'refined_video_bytes', 
+        'all_baseline_b64_str', 
+        'all_gan_b64_str', 
+        'all_dae_b64_str', 
+        'model_confidence',
+        'pose_segments',
+        'stitched_baseline_pose',
+        'refined_type'
+    ]
+    for key in keys_to_clear:
+        if key in st.session_state:
+            del st.session_state[key]
+
 # ---
-# 2. SIDEBAR NAVIGATION
+# 2. SIDEBAR: AUTHENTICATION & NAVIGATION
 # ---
 st.sidebar.title("Text to Sign Language 🤖")
-st.sidebar.markdown("A multi-stage pipeline for sign language generation using VAEs, Transformers, GANs, and Diffusion.")
 
-page = st.sidebar.radio(
-    "Navigation",
-    [
-        "Live Demo",
-        "Model Showcase",
-        "Quantitative Metrics",
-        "Model Comparison",
-        "Training Plots",
-        "Pipeline Explained"
-    ],
-    index=0
-)
+if 'logged_in' not in st.session_state:
+    st.session_state.logged_in = False
+if 'username' not in st.session_state:
+    st.session_state.username = ""
+
+if not st.session_state.logged_in:
+    st.sidebar.header("Authentication")
+    auth_mode = st.sidebar.radio("Choose Option", ["Login", "Sign Up"])
+    
+    user_input = st.sidebar.text_input("Username")
+    pass_input = st.sidebar.text_input("Password", type="password")
+    
+    if auth_mode == "Login":
+        if st.sidebar.button("Login"):
+            if db_utils.check_login(user_input, pass_input):
+                st.session_state.logged_in = True
+                st.session_state.username = user_input
+                # --- FIX: Clear previous user data on login ---
+                clear_generation_state()
+                st.rerun()
+            else:
+                st.sidebar.error("Invalid credentials")
+    else:
+        if st.sidebar.button("Create Account"):
+            if user_input and pass_input:
+                if db_utils.create_user(user_input, pass_input):
+                    st.sidebar.success("Account created! Please login.")
+                else:
+                    st.sidebar.error("Username taken.")
+            else:
+                st.sidebar.error("Please fill all fields.")
+    
+    st.info("Please login to access the application features.")
+    st.stop()
+
+else:
+    st.sidebar.success(f"Logged in as: {st.session_state.username}")
+    
+    if st.sidebar.button("Logout"):
+        st.session_state.logged_in = False
+        st.session_state.username = ""
+        # --- FIX: Clear data on logout ---
+        clear_generation_state()
+        st.rerun()
+        
+    with st.sidebar.expander("Danger Zone"):
+        st.warning("Deleting your account will remove your access immediately.")
+        if st.button("Delete My Account"):
+            db_utils.delete_account(st.session_state.username)
+            st.session_state.logged_in = False
+            st.session_state.username = ""
+            # --- FIX: Clear data on delete ---
+            clear_generation_state()
+            st.rerun()
+
+    if st.session_state.username == "admin":
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🔐 Admin Audit")
+        if st.sidebar.checkbox("Show Database Data"):
+            st.title("👮‍♂️ Admin Database View")
+            conn = sqlite3.connect("app_data.db")
+            st.subheader("User Registry")
+            try:
+                st.dataframe(pd.read_sql("SELECT * FROM users", conn))
+            except: st.error("Empty/Error Users")
+            st.subheader("Feedback Logs")
+            try:
+                st.dataframe(pd.read_sql("SELECT * FROM feedback", conn))
+            except: st.error("Empty/Error Feedback")
+            conn.close()
+            st.stop()
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("A multi-stage pipeline for sign language generation using VAEs, Transformers, GANs, and Diffusion.")
+
+    page = st.sidebar.radio(
+        "Navigation",
+        [
+            "Live Demo",
+            "Model Showcase",
+            "Quantitative Metrics",
+            "Model Comparison",
+            "Training Plots",
+            "Pipeline Explained"
+        ],
+        index=0
+    )
 
 # ---
 # 3. UI PAGES
@@ -90,35 +209,30 @@ if page == "Live Demo":
         )
 
         if st.button("Generate Baseline Sign", type="primary"):
-            if 'refined_video_bytes' in st.session_state:  # --- FIX 1 ---
-                del st.session_state['refined_video_bytes']
-            
-            # Clear the "all" panel state if we generate a single baseline
-            if 'all_baseline_b64_str' in st.session_state:
-                del st.session_state['all_baseline_b64_str']
-            if 'all_gan_b64_str' in st.session_state:
-                del st.session_state['all_gan_b64_str']
-            if 'all_dae_b64_str' in st.session_state:
-                del st.session_state['all_dae_b64_str']
+            # Clean up state specific to refinement to ensure clean slate
+            if 'refined_video_bytes' in st.session_state: del st.session_state['refined_video_bytes']
+            if 'all_baseline_b64_str' in st.session_state: del st.session_state['all_baseline_b64_str']
 
-            with st.spinner("Generating... (This runs the Transformer & VQ-VAE lookup)"):
+            with st.spinner("Generating..."):
                 try:
                     # 1. Text -> Tokens
                     src, src_length, src_mask = pipeline.translate_and_tokenize(
                         text_input, text_vocab=assets["text_vocab"]
                     )
                     
-                    # 2. Tokens -> Poses (Baseline)
-                    segments, baseline_pose = pipeline.run_text_to_baseline(
+                    # 2. Tokens -> Poses (Baseline) + Confidence
+                    segments, baseline_pose, confidence = pipeline.run_text_to_baseline(
                         src, src_length, src_mask,
                         trans_model=assets["trans_model"],
                         vq_config=assets["vq_config"]
                     )
                     
+                    st.session_state.model_confidence = confidence
+                    
                     if baseline_pose is None:
                         st.error("The model predicted an empty sequence. Please try a different sentence.")
                     else:
-                        # 3. Save Baseline Video (UNSMOOTHED)
+                        # 3. Save Baseline Video
                         pipeline.save_video(
                             baseline_pose,
                             file_path=LIVE_BASELINE_VIDEO,
@@ -126,42 +240,45 @@ if page == "Live Demo":
                             smoothed=False
                         )
                         
-                        # --- FIX 2: Read bytes and store them ---
                         with open(LIVE_BASELINE_VIDEO, "rb") as f:
                             video_bytes = f.read()
                         st.session_state.baseline_video_bytes = video_bytes
-                        # --- END FIX ---
                         
-                        # Save poses for refiners to use
+                        # Save intermediate data
                         st.session_state.pose_segments = segments
                         st.session_state.stitched_baseline_pose = baseline_pose
 
                 except Exception as e:
-                    st.error(f"An error occurred during baseline generation: {e}")
-                    if 'st.session_state' in locals():
-                        if 'baseline_video_bytes' in st.session_state:
-                            del st.session_state['baseline_video_bytes']
+                    st.error(f"An error occurred: {e}")
 
-        # --- Display Baseline Video ---
-        if 'baseline_video_bytes' in st.session_state:  # --- FIX 3 ---
-            st.subheader("1. Baseline Generation (VQ-VAE + Transformer)")
-            st.markdown("This is the raw, 'robotic' output from the main Transformer model.")
+        # --- Display Baseline & Confidence ---
+        if 'baseline_video_bytes' in st.session_state:
+            st.subheader("1. Baseline Generation")
+            
+            conf = st.session_state.get('model_confidence', 0.0)
+            
+            # --- FIX: Center the video using 0.2/0.6/0.2 layout ---
             vid_cols = st.columns([0.2, 0.6, 0.2])
+            
             with vid_cols[1]:
                 st.video(st.session_state.baseline_video_bytes)
-            
+                
+                # Display Ethical Info directly below video
+                st.markdown("---")
+                st.markdown("### 🛡️ AI Transparency")
+                if conf > 0.7:
+                    st.success(f"**High Confidence ({conf:.1%})**: The model is confident in this translation.")
+                elif conf > 0.4:
+                    st.warning(f"**Medium Confidence ({conf:.1%})**: The model is unsure. Verify signs manually.")
+                else:
+                    st.error(f"**Low Confidence ({conf:.1%})**: High risk of hallucination.")
+
             st.divider()
-            st.subheader("2. Refine Pose")
-            st.markdown("Apply a refiner model to make the movement smoother and more realistic.")
+            st.subheader("2. Refine Pose (Individual)")
             
             col1, col2 = st.columns(2)
-            
             with col1:
                 if st.button("Refine with GAN"):
-                    # Clear the "all" panel state
-                    if 'all_baseline_b64_str' in st.session_state:
-                        del st.session_state['all_baseline_b64_str']
-
                     with st.spinner("Refining with GAN..."):
                         try:
                             gan_pose = pipeline.run_gan_refiner(
@@ -170,26 +287,14 @@ if page == "Live Demo":
                                 assets["norm_stats"],
                                 assets["pose_dim"]
                             )
-                            pipeline.save_video(
-                                gan_pose,
-                                file_path=LIVE_GAN_VIDEO,
-                                fps=assets["fps"],
-                                smoothed=True
-                            )
-                            # --- Read bytes for GAN video ---
+                            pipeline.save_video(gan_pose, LIVE_GAN_VIDEO, assets["fps"], smoothed=True)
                             with open(LIVE_GAN_VIDEO, "rb") as f:
-                                video_bytes = f.read()
-                            st.session_state.refined_video_bytes = video_bytes
+                                st.session_state.refined_video_bytes = f.read()
                             st.session_state.refined_type = "GAN"
-                        except Exception as e:
-                            st.error(f"An error occurred during GAN refinement: {e}")
+                        except Exception as e: st.error(f"GAN Error: {e}")
 
             with col2:
                 if st.button("Refine with Diffusion"):
-                    # Clear the "all" panel state
-                    if 'all_baseline_b64_str' in st.session_state:
-                        del st.session_state['all_baseline_b64_str']
-                        
                     with st.spinner("Refining with Diffusion..."):
                         try:
                             dae_pose = pipeline.run_dae_refiner(
@@ -198,235 +303,75 @@ if page == "Live Demo":
                                 assets["vq_config"],
                                 assets["trans_config"]
                             )
-                            pipeline.save_video(
-                                dae_pose,
-                                file_path=LIVE_DAE_VIDEO,
-                                fps=assets["fps"],
-                                smoothed=True
-                            )
-                            # --- Read bytes for DAE video ---
+                            pipeline.save_video(dae_pose, LIVE_DAE_VIDEO, assets["fps"], smoothed=True)
                             with open(LIVE_DAE_VIDEO, "rb") as f:
-                                video_bytes = f.read()
-                            st.session_state.refined_video_bytes = video_bytes
+                                st.session_state.refined_video_bytes = f.read()
                             st.session_state.refined_type = "Diffusion"
-                        except Exception as e:
-                            st.error(f"An error occurred during Diffusion refinement: {e}")
+                        except Exception as e: st.error(f"Diffusion Error: {e}")
 
         # --- Display Refined Video ---
-        if 'refined_video_bytes' in st.session_state:  # --- FIX 5 ---
+        if 'refined_video_bytes' in st.session_state:
             st.subheader(f"3. Refined Output ({st.session_state.refined_type})")
-            st.markdown("This video has been post-processed with the selected refiner and includes frame interpolation for a more natural look.")
+            
+            # --- FIX: Center the video using 0.2/0.6/0.2 layout ---
             vid_cols = st.columns([0.2, 0.6, 0.2])
             with vid_cols[1]:
                 st.video(st.session_state.refined_video_bytes)
         
-        # -----------------------------------------------------------------
-        # --- NEW SECTION: ALL-IN-ONE GENERATION ---
-        # -----------------------------------------------------------------
+        # --- 3. GENERATE ALL AT ONCE ---
         st.divider()
-        st.subheader("3. All-in-One Generation & Comparison")
-        st.markdown("Generate all three video outputs (Baseline, GAN-refined, and Diffusion-refined) at once for a direct comparison.")
-        
+        st.subheader("3. All-in-One Comparison")
         if st.button("Generate All Models"):
-            # Clear single-view state
-            if 'baseline_video_bytes' in st.session_state:
-                del st.session_state['baseline_video_bytes']
-            if 'refined_video_bytes' in st.session_state:
-                del st.session_state['refined_video_bytes']
-                
-            # Clear all three video byte keys for this specific panel
-            if 'all_baseline_b64_str' in st.session_state:
-                del st.session_state['all_baseline_b64_str']
-            if 'all_gan_b64_str' in st.session_state:
-                del st.session_state['all_gan_b64_str']
-            if 'all_dae_b64_str' in st.session_state:
-                del st.session_state['all_dae_b64_str']
+            # Clear previous states
+            clear_generation_state()
 
-            with st.spinner("Generating all three videos... This may take a minute."):
+            with st.spinner("Generating pipeline..."):
                 try:
-                    # --- 1. BASELINE ---
-                    st.toast("Generating Baseline...")
-                    src, src_length, src_mask = pipeline.translate_and_tokenize(
-                        text_input, text_vocab=assets["text_vocab"]
-                    )
-                    segments, baseline_pose = pipeline.run_text_to_baseline(
-                        src, src_length, src_mask,
-                        trans_model=assets["trans_model"],
-                        vq_config=assets["vq_config"]
-                    )
+                    src, src_length, src_mask = pipeline.translate_and_tokenize(text_input, assets["text_vocab"])
+                    segments, baseline_pose, _ = pipeline.run_text_to_baseline(src, src_length, src_mask, assets["trans_model"], assets["vq_config"])
                     
-                    if baseline_pose is None:
-                        st.error("The model predicted an empty sequence. Please try a different sentence.")
-                    else:
-                        # Save baseline video
-                        pipeline.save_video(
-                            baseline_pose,
-                            file_path=LIVE_BASELINE_VIDEO,
-                            fps=assets["fps"],
-                            smoothed=False
-                        )
+                    if baseline_pose is not None:
+                        pipeline.save_video(baseline_pose, LIVE_BASELINE_VIDEO, assets["fps"], False)
                         with open(LIVE_BASELINE_VIDEO, "rb") as f:
-                            baseline_bytes = f.read()
-                            # <-- 2. ENCODE TO BASE64 -->
-                            st.session_state.all_baseline_b64_str = base64.b64encode(baseline_bytes).decode()
+                            st.session_state.all_baseline_b64_str = base64.b64encode(f.read()).decode()
                         
-                        # Store intermediate poses
-                        st.session_state.pose_segments = segments
-                        st.session_state.stitched_baseline_pose = baseline_pose
-
-                        # --- 2. GAN REFINER ---
-                        st.toast("Refining with GAN...")
-                        gan_pose = pipeline.run_gan_refiner(
-                            st.session_state.stitched_baseline_pose,
-                            assets["gan_model"],
-                            assets["norm_stats"],
-                            assets["pose_dim"]
-                        )
-                        pipeline.save_video(
-                            gan_pose,
-                            file_path=LIVE_GAN_VIDEO,
-                            fps=assets["fps"],
-                            smoothed=True
-                        )
+                        gan_pose = pipeline.run_gan_refiner(baseline_pose, assets["gan_model"], assets["norm_stats"], assets["pose_dim"])
+                        pipeline.save_video(gan_pose, LIVE_GAN_VIDEO, assets["fps"], True)
                         with open(LIVE_GAN_VIDEO, "rb") as f:
-                            gan_bytes = f.read()
-                            # <-- 2. ENCODE TO BASE64 -->
-                            st.session_state.all_gan_b64_str = base64.b64encode(gan_bytes).decode()
-
-                        # --- 3. DIFFUSION REFINER ---
-                        st.toast("Refining with Diffusion...")
-                        dae_pose = pipeline.run_dae_refiner(
-                            st.session_state.pose_segments,
-                            assets["dae_model"],
-                            assets["vq_config"],
-                            assets["trans_config"]
-                        )
-                        pipeline.save_video(
-                            dae_pose,
-                            file_path=LIVE_DAE_VIDEO,
-                            fps=assets["fps"],
-                            smoothed=True
-                        )
+                            st.session_state.all_gan_b64_str = base64.b64encode(f.read()).decode()
+                            
+                        dae_pose = pipeline.run_dae_refiner(segments, assets["dae_model"], assets["vq_config"], assets["trans_config"])
+                        pipeline.save_video(dae_pose, LIVE_DAE_VIDEO, assets["fps"], True)
                         with open(LIVE_DAE_VIDEO, "rb") as f:
-                            dae_bytes = f.read()
-                            # <-- 2. ENCODE TO BASE64 -->
-                            st.session_state.all_dae_b64_str = base64.b64encode(dae_bytes).decode()
-                        
-                        st.toast("All videos generated!")
+                            st.session_state.all_dae_b64_str = base64.b64encode(f.read()).decode()
+                except Exception as e: st.error(e)
 
-                except Exception as e:
-                    st.error(f"An error occurred during 'Generate All' process: {e}")
-                    # Clear keys on failure
-                    if 'all_baseline_b64_str' in st.session_state:
-                        del st.session_state['all_baseline_b64_str']
-                    if 'all_gan_b64_str' in st.session_state:
-                        del st.session_state['all_gan_b64_str']
-                    if 'all_dae_b64_str' in st.session_state:
-                        del st.session_state['all_dae_b64_str']
-
-        # --- 3. REPLACED DISPLAY LOGIC ---
-        # Check for the new base64 string keys
-        if 'all_baseline_b64_str' in st.session_state and 'all_gan_b64_str' in st.session_state and 'all_dae_b64_str' in st.session_state:
-            
-            # Craft the custom HTML component
+        if 'all_baseline_b64_str' in st.session_state:
             html_player = f"""
-                <style>
-                    .controls {{
-                        text-align: center;
-                        margin: 15px 0;
-                        display: flex;
-                        justify-content: center;
-                        gap: 10px;
-                    }}
-                    .controls button {{
-                        padding: 8px 16px;
-                        font-size: 16px;
-                        border: none;
-                        border-radius: 5px;
-                        cursor: pointer;
-                        background-color: #f0f2f6;
-                        color: #31333F;
-                        transition: background-color 0.2s;
-                    }}
-                    .controls button:hover {{
-                        background-color: #e6e8eb;
-                    }}
-
-                    /* --- UPDATED STYLES --- */
-                    .video-container {{
-                        display: flex;
-                        justify-content: space-around;
-                        align-items: flex-start; /* Align to top */
-                        gap: 15px; /* Added a bit more gap */
-                    }}
-                    .video-column {{
-                        flex: 1; /* Each column will take equal space */
-                        min-width: 0; /* Prevent flex overflow */
-                        text-align: center; /* Center the label */
-                    }}
-                    .video-label {{
-                        text-align: center;
-                        font-size: 1.1em;
-                        font-weight: 600;
-                        margin-bottom: 8px; /* Added margin */
-                    }}
-                    .video-player {{
-                        width: 100%; /* Video fills its column */
-                        height: auto; /* Maintain aspect ratio */
-                        border-radius: 5px;
-                        background-color: #000; /* Added for visual*/
-                    }}
-                    /* --- END UPDATED STYLES --- */
-                </style>
-
-                <div class="controls">
-                    <button id="playBtn">▶️ Play All</button>
-                    <button id="pauseBtn">⏸️ Pause All</button>
-                    <button id="resetBtn">⏮️ Reset All</button>
+                <div style="display: flex; gap: 10px; justify-content: center;">
+                    <div style="flex: 1; text-align: center;"><h4>Baseline</h4><video width="100%" controls src="data:video/mp4;base64,{st.session_state.all_baseline_b64_str}"></video></div>
+                    <div style="flex: 1; text-align: center;"><h4>GAN</h4><video width="100%" controls src="data:video/mp4;base64,{st.session_state.all_gan_b64_str}"></video></div>
+                    <div style="flex: 1; text-align: center;"><h4>Diffusion</h4><video width="100%" controls src="data:video/mp4;base64,{st.session_state.all_dae_b64_str}"></video></div>
                 </div>
-
-                <div class="video-container">
-                    <div class="video-column">
-                        <p class="video-label">Baseline (Raw)</p>
-                        <video id="vid1" class="video-player" controls muted loop src="data:video/mp4;base64,{st.session_state.all_baseline_b64_str}"></video>
-                    </div>
-                    <div class="video-column">
-                        <p class="video-label">Refined (GAN)</p>
-                        <video id="vid2" class="video-player" controls muted loop src="data:video/mp4;base64,{st.session_state.all_gan_b64_str}"></video>
-                    </div>
-                    <div class="video-column">
-                        <p class="video-label">Refined (Diffusion)</p>
-                        <video id="vid3" class="video-player" controls muted loop src="data:video/mp4;base64,{st.session_state.all_dae_b64_str}"></video>
-                    </div>
-                </div>
-                <script>
-                    const vid1 = document.getElementById("vid1");
-                    const vid2 = document.getElementById("vid2");
-                    const vid3 = document.getElementById("vid3");
-                    const videos = [vid1, vid2, vid3];
-
-                    document.getElementById("playBtn").onclick = () => videos.forEach(v => v.play());
-                    document.getElementById("pauseBtn").onclick = () => videos.forEach(v => v.pause());
-                    document.getElementById("resetBtn").onclick = () => videos.forEach(v => {{
-                        v.pause();
-                        v.currentTime = 0;
-                    }});
-                </script>
             """
-            
-            # Render the component
-            # Adjust height as needed, 450 might be too small now
-            components.html(html_player, height=500)
+            components.html(html_player, height=400)
 
-        # -----------------------------------------------------------------
-        # --- END OF NEW SECTION ---
-        # -----------------------------------------------------------------
+        # --- ETHICAL FEATURE: Feedback Loop ---
+        if 'baseline_video_bytes' in st.session_state or 'all_baseline_b64_str' in st.session_state:
+            st.divider()
+            st.subheader("4. Help us Improve")
+            with st.form("feedback_form"):
+                rating = st.radio("How was the translation?", ["Good", "Average", "Bad", "Offensive"])
+                comments = st.text_area("Additional Comments (Optional)")
+                if st.form_submit_button("Submit"):
+                    db_utils.save_feedback(st.session_state.username, text_input, rating, comments)
+                    st.success("Feedback recorded.")
 
     else:
-        st.error("Models are not loaded. The app cannot function. Please check the logs.")
+        st.error("Models are not loaded. The app cannot function.")
 
 # -----------------------------------------------------------------
-# PAGE 2: MODEL SHOWCASE
+# PAGE 2: MODEL SHOWCASE (FULL CONTENT RESTORED)
 # -----------------------------------------------------------------
 elif page == "Model Showcase":
     st.title("Model Showcase: Pre-Generated Example")
@@ -452,10 +397,7 @@ elif page == "Model Showcase":
     if Path("static/baseline_example.mp4").exists():
         vid_cols = st.columns([0.2, 0.6, 0.2])
         with vid_cols[1]:
-            if Path("static/baseline_example.mp4").exists():
-                st.video("static/baseline_example.mp4")
-            else:
-                st.warning("static/baseline_example.mp4 not found.")
+            st.video("static/baseline_example.mp4")
     else:
         st.warning("static/baseline_example.mp4 not found.")
 
@@ -478,7 +420,7 @@ elif page == "Model Showcase":
         st.caption("The Diffusion refiner 'denoises' the robotic motion, resulting in a very smooth pose.")
 
 # -----------------------------------------------------------------
-# PAGE 3: QUANTITATIVE METRICS
+# PAGE 3: QUANTITATIVE METRICS (FULL CONTENT RESTORED)
 # -----------------------------------------------------------------
 elif page == "Quantitative Metrics":
     st.title("Quantitative Model Performance")
@@ -616,23 +558,21 @@ elif page == "Quantitative Metrics":
         )
 
 # -----------------------------------------------------------------
-# PAGE 4: MODEL COMPARISON
+# PAGE 4: MODEL COMPARISON (FULL CONTENT RESTORED)
 # -----------------------------------------------------------------
 elif page == "Model Comparison":
     st.title("Model Architecture & Role Comparison")
     st.markdown("This project integrates four distinct deep learning models, each with a specialized role in the text-to-sign pipeline.")
 
-    # We need pandas to create the transposed table
     import pandas as pd
 
-    # Define the comparison data with models as keys (columns)
     comparison_data = {
         'VQ-VAE': {
             'Primary Role': "Pose Quantizer / Discretizer",
             'Model Type': "Vector-Quantized Variational Autoencoder",
             'Core Architecture': "1D CNN Encoder/Decoder + Discrete Codebook",
             'Operating Domain': "Continuous Pose Segments -> Discrete Latent Space",
-            'Training Objective': "Reconstruct pose segments with high fidelity after forcing them through the discrete codecodebook bottleneck.",
+            'Training Objective': "Reconstruct pose segments with high fidelity after forcing them through the discrete codebook bottleneck.",
             'Key Loss Function(s)': "L1/MSE Reconstruction Loss + Codebook Commitment Loss",
             'Inference Input': "N/A (Its learned codebook is used)",
             'Inference Output': "A 4000-vector 'Codebook' of pose micro-motions"
@@ -669,17 +609,12 @@ elif page == "Model Comparison":
         }
     }
     
-    # Create DataFrame from the dictionary
     df_comparison = pd.DataFrame(comparison_data)
-    
-    # Set the index name
     df_comparison.index.name = "Feature"
-    
-    # Display the transposed dataframe
     st.dataframe(df_comparison, use_container_width=True)
 
 # -----------------------------------------------------------------
-# PAGE 5: TRAINING PLOTS
+# PAGE 5: TRAINING PLOTS (FULL CONTENT RESTORED)
 # -----------------------------------------------------------------
 elif page == "Training Plots":
     st.title("Training & Validation Plots")
@@ -704,7 +639,7 @@ elif page == "Training Plots":
         components.html(wandb_plots["diffusion"], height=700, scrolling=True)
 
 # -----------------------------------------------------------------
-# PAGE 6: PIPELINE EXPLAINED
+# PAGE 6: PIPELINE EXPLAINED (FULL CONTENT RESTORED)
 # -----------------------------------------------------------------
 elif page == "Pipeline Explained":
     st.title("Project Pipeline Explained")
@@ -726,8 +661,6 @@ elif page == "Pipeline Explained":
         * In this project, the codebook contains **4000 unique vectors**. Each vector is a "pose-word" that represents a fundamental micro-motion.
         
         This offline step is crucial: it converts complex, continuous motion into a finite vocabulary, turning the problem into a sequence-to-sequence task.
-        
-        
         """)
         
     with st.expander("Step 2: Transformer (Live Inference)"):

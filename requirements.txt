@@ -1,19 +1,31 @@
 # Core AI and ML
-numpy<2.0
-lightning==2.1.4
+
 torch
-torchmetrics
 scikit-learn
-opencv-python
 
 # Repository Specific
+ffmpeg
+
+# App Framework
+deep-translator
+gdown
+lightning==2.1.4
+numpy<2
+torchmetrics
+matplotlib
+wandb
 fastdtw
 sacrebleu==2.4.0
 tokenizers
 jiwer
+fasttext
+opencv-python
+mediapipe
+pycpd
 ffmpeg
 lmdb
-
-# App Framework
+diffusers
+accelerate
+seaborn
+pandas
 streamlit
-deep-translator

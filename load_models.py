@@ -17,6 +17,9 @@ from pathlib import Path
 import torch.nn.functional as F
 from torch import Tensor
 import sys
+import gdown  # <-- Required for downloading
+import zipfile
+import shutil
 
 # --- Imports from your 'src' folder ---
 # We REMOVE find_best_model, it's not needed
@@ -113,15 +116,59 @@ class DiffusionRefiner(L.LightningModule):
         pass
 
 # ---
+# GOOGLE DRIVE DOWNLOAD LOGIC
+# ---
+def download_and_extract_models():
+    """
+    Checks if models exist. If not, downloads from Google Drive and extracts.
+    """
+    models_dir = Path("models")
+    
+    # If the directory exists and is not empty, assume models are there
+    if models_dir.exists() and any(models_dir.iterdir()):
+        print("✅ Models directory detected. Skipping download.")
+        return
+
+    print("⬇️ Models not found. Starting download from Google Drive...")
+    
+    # Your File ID from the link: 1SJrndE1fB0ftDmMv8kzB7JXy0jvMNziP
+    file_id = '1SJrndE1fB0ftDmMv8kzB7JXy0jvMNziP'
+    url = f'https://drive.google.com/uc?id={file_id}'
+    output = 'models.zip'
+    
+    try:
+        gdown.download(url, output, quiet=False)
+        
+        if not os.path.exists(output):
+            st.error("Download failed: models.zip not found.")
+            st.stop()
+            
+        print("📦 Extracting models.zip...")
+        with zipfile.ZipFile(output, 'r') as zip_ref:
+            zip_ref.extractall(".") # Extracts into current directory
+            
+        print("✅ Extraction complete!")
+        
+        # Clean up the zip file to save disk space on Cloud
+        os.remove(output)
+        
+    except Exception as e:
+        st.error(f"Failed to download or extract models: {e}")
+        st.stop()
+
+# ---
 # MAIN ASSET LOADING FUNCTION
 # ---
 
-@st.cache_resource(show_spinner="Loading all AI models, please wait...")
+@st.cache_resource(show_spinner="Downloading & Loading AI models... (This takes time on first run)")
 def load_all_assets():
     """
     Loads all models, configs, and vocabs into memory on CPU
     and caches them for the Streamlit app.
     """
+    
+    # --- 0. ENSURE MODELS ARE PRESENT ---
+    download_and_extract_models()
     
     # --- 1. Set Device ---
     device = torch.device("cpu")
@@ -132,6 +179,9 @@ def load_all_assets():
         print("Loading VQ-VAE model...")
         # --- FIX: Use your file structure ---
         vq_model_dir = Path("./models/vq_models/phix_codebook")
+        if not vq_model_dir.exists():
+             raise FileNotFoundError(f"Directory not found: {vq_model_dir}")
+
         vq_config = load_config(vq_model_dir / "config.yaml")
         # --- FIX: Use exact checkpoint name ---
         vq_checkpoint_path = vq_model_dir / "vq_vae_model.ckpt"
