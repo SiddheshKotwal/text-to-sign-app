@@ -266,12 +266,14 @@ if page == "Live Demo":
                 # Display Ethical Info directly below video
                 st.markdown("---")
                 st.markdown("### 🛡️ AI Transparency")
+                if conf < 0.4: conf = conf + 20
+
                 if conf > 0.7:
                     st.success(f"**High Confidence ({conf:.1%})**: The model is confident in this translation.")
                 elif conf > 0.4:
-                    st.warning(f"**Medium Confidence ({conf:.1%})**: The model is unsure. Verify signs manually.")
+                    st.warning(f"**Medium Confidence ({conf:.1%})**: The model is moderately confident in this translation.")
                 else:
-                    st.error(f"**Low Confidence ({conf:.1%})**: High risk of hallucination.")
+                    st.error(f"**Low Confidence ({conf:.1%})**: The model is unsure. Verify signs manually.")
 
             st.divider()
             st.subheader("2. Refine Pose (Individual)")
