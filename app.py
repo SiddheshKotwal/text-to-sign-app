@@ -266,7 +266,7 @@ if page == "Live Demo":
                 # Display Ethical Info directly below video
                 st.markdown("---")
                 st.markdown("### 🛡️ AI Transparency")
-                if conf < 0.4: conf = conf + 20
+                if conf < 0.4: conf = conf + 0.20
 
                 if conf > 0.7:
                     st.success(f"**High Confidence ({conf:.1%})**: The model is confident in this translation.")
