@@ -19,7 +19,7 @@ sacrebleu==2.4.0
 tokenizers
 jiwer
 fasttext
-opencv-python
+opencv-python-headless
 mediapipe
 pycpd
 ffmpeg
